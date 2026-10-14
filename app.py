@@ -32,7 +32,12 @@ END_DATE = "2023-06-30"
 OM_URL = "https://archive-api.open-meteo.com/v1/archive"
 JITTER = 1e-8
 
-# Section 13 of the notebook, averaged over Apr/Jun/Aug/Oct 2023 (MAE, % soil moisture)
+HIST_KERNEL_FILE = "historical_kernel.json"        # exported by notebook section 16
+RESULTS_FILE = "experiment_results.json"           # exported by notebook section 16
+N_TEST_PROOF = 40                                  # held-out test stations in Proof mode (same as notebook)
+
+# Fallback only: notebook section 13 averages (Apr/Jun/Aug/Oct 2023). Replaced by RESULTS_FILE when present.
+EXPERIMENT_SOURCE = "notebook section 13 (kernel learned per run from non-test stations)"
 EXPERIMENT = {
     5:  {"random, no prior": 8.29, "random + prior": 8.65, "MI + prior": 7.66, "calib-MI + prior": 7.21},
     10: {"random, no prior": 7.64, "random + prior": 7.32, "MI + prior": 7.19, "calib-MI + prior": 7.01},
@@ -40,6 +45,15 @@ EXPERIMENT = {
     30: {"random, no prior": 6.84, "random + prior": 6.68, "MI + prior": 6.68, "calib-MI + prior": 6.67},
 }
 EXPERIMENT_WINS = "At 5 sensors, calibration-aware MI + prior beat random placement without the prior in 167 of 200 paired runs (p < 0.0001)."
+
+if os.path.exists(RESULTS_FILE):
+    with open(RESULTS_FILE) as _f:
+        _res = json.load(_f)
+    EXPERIMENT = {}
+    for _n in _res["mae"]:
+        EXPERIMENT[int(_n)] = _res["mae"][_n]
+    EXPERIMENT_SOURCE = _res.get("source", RESULTS_FILE)
+    EXPERIMENT_WINS = "Win counts and p-values for every comparison are printed in notebook section 16."
 
 CRITERIA = ["Calibration-aware MI (best)", "Mutual information", "Entropy (least confident)"]
 
@@ -324,13 +338,17 @@ def tool_predict(ctx, lat, lon):
 
 
 def tool_compare(ctx):
-    lines = ["Leakage-free experiment, averaged over Apr/Jun/Aug/Oct 2023 (lower error is better):", "",
-             "| sensors | random, no prior | random + prior | MI + prior | calib-MI + prior |",
-             "|---|---|---|---|---|"]
+    first = list(EXPERIMENT)[0]
+    methods = list(EXPERIMENT[first])
+    lines = ["Prediction error (MAE, % soil moisture) averaged over Apr/Jun/Aug/Oct 2023 — lower is better.",
+             f"Source: {EXPERIMENT_SOURCE}.", "",
+             "| sensors | " + " | ".join(methods) + " |",
+             "|---" * (len(methods) + 1) + "|"]
     for n in EXPERIMENT:
-        e = EXPERIMENT[n]
-        lines.append(f"| {n} | {e['random, no prior']:.2f} | {e['random + prior']:.2f} | "
-                     f"{e['MI + prior']:.2f} | {e['calib-MI + prior']:.2f} |")
+        row = f"| {n} |"
+        for m in methods:
+            row = row + f" {EXPERIMENT[n][m]:.2f} |"
+        lines.append(row)
     lines.append("")
     lines.append(EXPERIMENT_WINS)
     return "\n".join(lines)
@@ -429,8 +447,20 @@ F_all = design(p_all)
 
 a0, b0 = linear_fit(p_all, y_all)
 resid_all = y_all - (a0 + b0 * p_all)
-kernel = learn_kernel(X_all, resid_all)
+kernel = learn_kernel(X_all, resid_all)          # Real network mode: uses every real sensor (no evaluation claims)
 S_HIST = float(resid_all.std())
+
+
+def load_hist_kernel():
+    """Kernel learned from June 2022 (notebook section 16) - uses no 2023 reading at all."""
+    if not os.path.exists(HIST_KERNEL_FILE):
+        return None, None
+    with open(HIST_KERNEL_FILE) as f:
+        h = json.load(f)
+    k = (ConstantKernel(h["constant"], "fixed") * Matern(length_scale=h["length_scale"], nu=h["nu"],
+                                                         length_scale_bounds="fixed")
+         + WhiteKernel(h["noise"], "fixed"))
+    return k, float(h["resid_std"])
 
 grid = load_grid(float(df.longitude.min()), float(df.longitude.max()),
                  float(df.latitude.min()), float(df.latitude.max()))
@@ -452,9 +482,13 @@ with st.sidebar:
         n_start = st.slider("Pretend only this many sensors exist", 3, 60, 8)
         seed = st.number_input("Random seed", 0, 999, 0)
         if st.button("Reset simulation", key="reset") or "deployed" not in st.session_state \
+                or "test_idx" not in st.session_state \
                 or st.session_state.get("cfg") != (n_start, seed):
             rng = np.random.default_rng(int(seed))
-            st.session_state.deployed = [int(i) for i in rng.choice(len(df), n_start, replace=False)]
+            order = [int(i) for i in rng.permutation(len(df))]
+            st.session_state.test_idx = order[:N_TEST_PROOF]          # never used, only scored
+            st.session_state.pool = order[N_TEST_PROOF:]              # candidate sites
+            st.session_state.deployed = [int(i) for i in rng.choice(st.session_state.pool, n_start, replace=False)]
             st.session_state.cfg = (n_start, seed)
             st.session_state.recs = []
     else:
@@ -512,11 +546,28 @@ if mode == "real":
            "recommend_fn": recommend_fn, "summary": summary}
 else:
     deployed = st.session_state.deployed
-    unused = [i for i in range(len(df)) if i not in deployed]
-    model = fit_model(kernel, X_all[deployed], y_all[deployed], p_all[deployed], S_HIST)
+    test_idx = st.session_state.test_idx
+    pool = st.session_state.pool
+    unused = [i for i in pool if i not in deployed]          # candidates = pool only, never test stations
+
+    # Leakage-free: the kernel comes from June 2022 if the notebook export is present; otherwise it is
+    # learned from the pool stations only. The 40 test stations are never used for anything but scoring.
+    proof_kernel, proof_s = load_hist_kernel()
+    if proof_kernel is not None:
+        kernel_note = "Kernel learned from June 2022 (notebook section 16) — no 2023 reading outside the deployed sensors is used."
+    else:
+        a_p, b_p = linear_fit(p_all[pool], y_all[pool])
+        r_p = y_all[pool] - (a_p + b_p * p_all[pool])
+        proof_kernel = learn_kernel(X_all[pool], r_p)
+        proof_s = float(r_p.std())
+        kernel_note = (f"`{HIST_KERNEL_FILE}` not found, so the kernel was learned from the non-test stations only. "
+                       "Add the file from notebook section 16 for the strict version.")
+    kernel = proof_kernel                                       # used by placement below too
+
+    model = fit_model(kernel, X_all[deployed], y_all[deployed], p_all[deployed], proof_s)
     grid_mean, grid_std = predict(model, X_grid, grid["era5"].values, latent=True)
-    unused_mean, _ = predict(model, X_all[unused], p_all[unused])
-    mae = float(np.mean(np.abs(unused_mean - y_all[unused]))) if unused else 0.0
+    test_mean, _ = predict(model, X_all[test_idx], p_all[test_idx])
+    mae = float(np.mean(np.abs(test_mean - y_all[test_idx])))
 
     def recommend_fn(k):
         picks = greedy_pick(kernel, X_all[deployed], F_all[deployed], X_all[unused], F_all[unused], k, criterion)
@@ -527,9 +578,9 @@ else:
             out.append(f"{s['name']} ({s['stateCode']}) — lat {s['latitude']:.2f}, lon {s['longitude']:.2f}")
         return out
 
-    summary = (f"Simulation: pretending only **{len(deployed)} sensors** exist out of {len(df)}. "
-               f"Average uncertainty is **±{grid_std.mean():.2f}%**, and the error at the {len(unused)} hidden "
-               f"stations is **{mae:.2f}%** (MAE).")
+    summary = (f"Simulation: pretending only **{len(deployed)} sensors** exist. Average uncertainty is "
+               f"**±{grid_std.mean():.2f}%**, and the error at the {len(test_idx)} held-out test stations is "
+               f"**{mae:.2f}%** (MAE). {kernel_note}")
     ctx = {"mode": mode, "df_known": df.iloc[deployed], "model": model, "criterion": criterion, "grid": grid,
            "grid_mean": grid_mean, "grid_std": grid_std, "suspicious": None,
            "recommend_fn": recommend_fn, "summary": summary}
@@ -545,12 +596,14 @@ if mode == "real":
               delta_color="inverse")
     c3.metric("Readings worth checking", len(suspicious))
 else:
-    st.info("**Proof (simulation)** — hides most real sensors, places them one by one, and checks the guesses "
-            "against the hidden real readings. This is how the method was tested in the notebook.")
+    st.info("**Proof (simulation)** — starts with a few real sensors, places more one by one, and scores the "
+            f"predictions on {N_TEST_PROOF} held-out test stations that are never used for anything else. "
+            "Same protocol as the notebook.")
+    st.caption(kernel_note)
     c1, c2, c3 = st.columns(3)
     c1.metric("Sensors in simulation", len(deployed))
     c2.metric("Avg uncertainty", f"±{grid_std.mean():.2f}%")
-    c3.metric("Error at hidden stations", f"{mae:.2f}%")
+    c3.metric(f"Error at {N_TEST_PROOF} test stations", f"{mae:.2f}%")
 st.caption(f"Calibration fitted on the sensors in use: station ≈ {model['a']:.1f} + {model['b']:.2f} × ERA5")
 
 left, right = st.columns([3, 2])
@@ -626,7 +679,11 @@ with left:
         for i in unused:
             s = df.iloc[i]
             folium.CircleMarker([s.latitude, s.longitude], radius=2, color="#888", fill=True,
-                                tooltip=f"{s['name']} ({s['stateCode']}) — hidden").add_to(fmap)
+                                tooltip=f"{s['name']} ({s['stateCode']}) — candidate site").add_to(fmap)
+        for i in test_idx:
+            s = df.iloc[i]
+            folium.CircleMarker([s.latitude, s.longitude], radius=4, color="#111", fill=False, weight=2,
+                                tooltip=f"{s['name']} ({s['stateCode']}) — held-out test station").add_to(fmap)
         for i in deployed:
             s = df.iloc[i]
             folium.CircleMarker([s.latitude, s.longitude], radius=5, color="#1f4e9c", fill=True, fill_opacity=1,
@@ -635,7 +692,8 @@ with left:
             s = df.iloc[st.session_state.recs[r]]
             folium.Marker([s.latitude, s.longitude], tooltip=f"#{r + 1}: {s['name']} ({s['stateCode']})",
                           icon=folium.Icon(color="red", icon="star")).add_to(fmap)
-        legend = "Blue = sensor in the simulation · grey = hidden station · red star = recommended next sensor"
+        legend = ("Blue = sensor in the simulation · grey = candidate site · black ring = held-out test station "
+                  "(never used) · red star = recommended next sensor")
 
     cmap.add_to(fmap)
     st_folium(fmap, height=520, use_container_width=True, returned_objects=[])

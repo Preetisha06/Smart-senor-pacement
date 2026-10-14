@@ -1,0 +1,8 @@
+{
+  "source": "learned from SCAN June 2022 residuals (calibrated ERA5 prior), notebook section 16",
+  "constant": 0.35693550424296444,
+  "length_scale": 1.5885721592876918,
+  "nu": 1.5,
+  "noise": 0.5639644770107605,
+  "resid_std": 7.816608303820803
+}

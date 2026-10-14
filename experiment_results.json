@@ -1,0 +1,37 @@
+{
+  "source": "notebook section 16 (strict evaluation, 4 months x 50 runs)",
+  "mae": {
+    "5": {
+      "random, no prior": 8.33,
+      "random + prior": 8.65,
+      "k-means (space) + prior": 8.05,
+      "k-means (space+wetness) + prior": 7.99,
+      "MI + prior": 8.04,
+      "calib-MI + prior": 7.29
+    },
+    "10": {
+      "random, no prior": 7.64,
+      "random + prior": 7.32,
+      "k-means (space) + prior": 7.07,
+      "k-means (space+wetness) + prior": 7.24,
+      "MI + prior": 7.35,
+      "calib-MI + prior": 6.96
+    },
+    "20": {
+      "random, no prior": 7.08,
+      "random + prior": 6.82,
+      "k-means (space) + prior": 6.84,
+      "k-means (space+wetness) + prior": 6.83,
+      "MI + prior": 6.76,
+      "calib-MI + prior": 6.75
+    },
+    "30": {
+      "random, no prior": 6.87,
+      "random + prior": 6.65,
+      "k-means (space) + prior": 6.78,
+      "k-means (space+wetness) + prior": 6.7,
+      "MI + prior": 6.65,
+      "calib-MI + prior": 6.61
+    }
+  }
+}
