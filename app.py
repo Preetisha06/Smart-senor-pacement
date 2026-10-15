@@ -32,19 +32,27 @@ END_DATE = "2023-06-30"
 OM_URL = "https://archive-api.open-meteo.com/v1/archive"
 JITTER = 1e-8
 
-HIST_KERNEL_FILE = "historical_kernel.json"        # exported by notebook section 16
-RESULTS_FILE = "experiment_results.json"           # exported by notebook section 16
-N_TEST_PROOF = 40                                  # held-out test stations in Proof mode (same as notebook)
+HIST_KERNEL_FILE = "historical_kernel.json"        # exported by sensor_placement_confirmatory.ipynb
+RESULTS_FILE = "experiment_results.json"           # exported by sensor_placement_confirmatory.ipynb
+N_TEST_PROOF = 40                                  # held-out test stations in Proof mode
 
-# Fallback only: notebook section 13 averages (Apr/Jun/Aug/Oct 2023). Replaced by RESULTS_FILE when present.
-EXPERIMENT_SOURCE = "notebook section 13 (kernel learned per run from non-test stations)"
+# Fallback only (used when RESULTS_FILE is missing): confirmatory 2024 means from
+# sensor_placement_confirmatory.ipynb section 6. Replaced by RESULTS_FILE when present.
+EXPERIMENT_SOURCE = "sensor_placement_confirmatory.ipynb - confirmatory 2024 evaluation (kernel from 2023)"
 EXPERIMENT = {
-    5:  {"random, no prior": 8.29, "random + prior": 8.65, "MI + prior": 7.66, "calib-MI + prior": 7.21},
-    10: {"random, no prior": 7.64, "random + prior": 7.32, "MI + prior": 7.19, "calib-MI + prior": 7.01},
-    20: {"random, no prior": 7.07, "random + prior": 6.85, "MI + prior": 6.77, "calib-MI + prior": 6.81},
-    30: {"random, no prior": 6.84, "random + prior": 6.68, "MI + prior": 6.68, "calib-MI + prior": 6.67},
+    5:  {"random, no prior": 8.02, "random + prior": 8.13, "k-means (space) + prior": 7.19,
+         "k-means (space+wetness) + prior": 7.26, "MI + prior": 7.39, "calib-MI + prior": 6.88},
+    10: {"random, no prior": 7.21, "random + prior": 6.84, "k-means (space) + prior": 6.58,
+         "k-means (space+wetness) + prior": 6.70, "MI + prior": 6.72, "calib-MI + prior": 6.52},
+    20: {"random, no prior": 6.57, "random + prior": 6.38, "k-means (space) + prior": 6.38,
+         "k-means (space+wetness) + prior": 6.26, "MI + prior": 6.31, "calib-MI + prior": 6.25},
+    30: {"random, no prior": 6.35, "random + prior": 6.24, "k-means (space) + prior": 6.32,
+         "k-means (space+wetness) + prior": 6.18, "MI + prior": 6.16, "calib-MI + prior": 6.09},
 }
-EXPERIMENT_WINS = "At 5 sensors, calibration-aware MI + prior beat random placement without the prior in 167 of 200 paired runs (p < 0.0001)."
+EXPERIMENT_WINS = ("Calibration-aware MI had the lowest mean error at every budget. Its gain over random placement "
+                   "without a prior has a 95% CI above zero at 5 and 10 sensors; the smaller gains over k-means and "
+                   "MI are within their CIs, and no comparison stays significant after Holm correction over 20 tests. "
+                   "Full table: sensor_placement_confirmatory.ipynb section 6.")
 
 if os.path.exists(RESULTS_FILE):
     with open(RESULTS_FILE) as _f:
@@ -53,7 +61,8 @@ if os.path.exists(RESULTS_FILE):
     for _n in _res["mae"]:
         EXPERIMENT[int(_n)] = _res["mae"][_n]
     EXPERIMENT_SOURCE = _res.get("source", RESULTS_FILE)
-    EXPERIMENT_WINS = "Win counts and p-values for every comparison are printed in notebook section 16."
+    EXPERIMENT_WINS = (EXPERIMENT_WINS if "confirmatory" in EXPERIMENT_SOURCE
+                       else "Confidence intervals and corrected p-values are printed in the source notebook.")
 
 CRITERIA = ["Calibration-aware MI (best)", "Mutual information", "Entropy (least confident)"]
 
@@ -77,15 +86,15 @@ def fetch_era5(lats, lons, batch=25, pause=6):
             if r.status_code == 429:
                 time.sleep(60)
                 continue
-            if r.status_code == 400 and "models" in params:
-                params.pop("models")
-                continue
             break
-        r.raise_for_status()
+        if r.status_code != 200:     # never silently switch to another model
+            raise RuntimeError(f"Open-Meteo ERA5-Land request failed ({r.status_code}): {r.text[:200]}")
         js = r.json()
         if isinstance(js, dict):
             js = [js]
         for loc in js:
+            if "hourly" not in loc or "soil_moisture_0_to_7cm" not in loc["hourly"]:
+                raise RuntimeError("Open-Meteo response has no ERA5-Land soil moisture")
             vals = [v for v in loc["hourly"]["soil_moisture_0_to_7cm"] if v is not None]
             out.append(100.0 * sum(vals) / len(vals) if vals else np.nan)
         if start + batch < len(lats):
@@ -159,14 +168,16 @@ def learn_kernel(X, resid):
 
 
 def fit_model(kernel, X, y, prior, s):
-    """Calibrated prior + GP on the residuals (the notebook's best mode).
-    s = residual spread of the full network, so uncertainty is on the same scale the kernel was learned on."""
-    a, b = linear_fit(prior, y)
-    resid = y - (a + b * prior)
-    m = resid.mean()
-    gp = GaussianProcessRegressor(kernel=kernel, optimizer=None, normalize_y=False)
-    gp.fit(X, (resid - m) / s)
-    return {"a": a, "b": b, "m": m, "s": s, "gp": gp, "X": X, "F": design(prior), "kernel": kernel}
+    """Universal kriging: calibration line a + b*ERA5 fitted by GLS jointly with the GP residual
+    (same model as sensor_placement_confirmatory.ipynb). s = fixed residual scale from historical data."""
+    F = design(prior)
+    ys = y / s
+    Ki = np.linalg.inv(kernel(X) + JITTER * np.eye(len(X)))
+    M = F.T @ Ki @ F + 1e-8 * np.eye(2)
+    beta = np.linalg.solve(M, F.T @ Ki @ ys)
+    alpha = Ki @ (ys - F @ beta)
+    return {"a": beta[0] * s, "b": beta[1] * s / 10.0, "beta": beta, "alpha": alpha, "s": s,
+            "X": X, "F": F, "kernel": kernel}
 
 
 def uk_var(kernel, Xq, Xs, Fq, Fs, latent=False):
@@ -198,8 +209,8 @@ def var_rest(kernel, Xc):
 
 
 def predict(model, Xq, prior_q, latent=False):
-    base = model["a"] + model["b"] * np.asarray(prior_q)
-    mean = base + model["gp"].predict(Xq) * model["s"] + model["m"]
+    Fq = design(prior_q)
+    mean = (Fq @ model["beta"] + model["kernel"](Xq, model["X"]) @ model["alpha"]) * model["s"]
     std = np.sqrt(uk_var(model["kernel"], Xq, model["X"], design(prior_q), model["F"], latent)) * model["s"]
     return mean, std
 
@@ -219,7 +230,7 @@ def greedy_pick(kernel, Xk, Fk, Xc, Fc, k, criterion):
         Xcc = Xc[cand]
         Fcc = Fc[cand]
         if criterion == CRITERIA[0]:
-            score = uk_var(kernel, Xcc, Xk, Fcc, Fk) / var_rest(kernel, Xcc)
+            score = uk_var(kernel, Xcc, Xk, Fcc, Fk) / uk_loo(kernel, Xcc, Fcc)
         elif criterion == CRITERIA[1]:
             score = post_var(kernel, Xcc, Xk) / var_rest(kernel, Xcc)
         else:
@@ -233,20 +244,29 @@ def greedy_pick(kernel, Xk, Fk, Xc, Fc, k, criterion):
     return chosen
 
 
+def uk_precision(kernel, X, F):
+    """Q = K^-1 - K^-1 F (F' K^-1 F)^-1 F' K^-1 (universal kriging with an estimated calibration line)."""
+    Ki = np.linalg.inv(kernel(X) + JITTER * np.eye(len(X)))
+    M = F.T @ Ki @ F + 1e-8 * np.eye(F.shape[1])
+    return Ki - Ki @ F @ np.linalg.inv(M) @ F.T @ Ki
+
+
+def uk_loo(kernel, Xc, Fc):
+    """Variance at each candidate given all the other candidates, calibration line estimated (1 / Q_ii)."""
+    return np.maximum(1.0 / np.diag(uk_precision(kernel, Xc, Fc)), 1e-12)
+
+
 def check_readings(kernel, X, y, prior, s):
     """Leave-one-out check: for every station, what would its neighbours + the calibrated prior
     have predicted if it didn't exist? A big gap (|z| > 2) = reading worth checking.
-    Uses the standard GP shortcut: LOO error = alpha_i / (K^-1)_ii, LOO variance = 1 / (K^-1)_ii."""
-    a, b = linear_fit(prior, y)
-    resid = y - (a + b * prior)
-    r = (resid - resid.mean()) / s
-    Kinv = np.linalg.inv(kernel(X) + JITTER * np.eye(len(X)))
-    alpha = Kinv @ r
+    Universal-kriging shortcut: LOO error = (Q y)_i / Q_ii, LOO variance = 1 / Q_ii."""
+    Q = uk_precision(kernel, X, design(prior))
+    qy = Q @ (y / s)
     expected = np.zeros(len(y))
     z = np.zeros(len(y))
     for i in range(len(y)):
-        loo_err = alpha[i] / Kinv[i, i]              # (actual - predicted), standardised
-        loo_std = np.sqrt(1.0 / Kinv[i, i])
+        loo_err = qy[i] / Q[i, i]                    # (actual - predicted), in units of s
+        loo_std = np.sqrt(1.0 / Q[i, i])
         z[i] = loo_err / loo_std
         expected[i] = y[i] - loo_err * s
     return expected, z
@@ -452,7 +472,7 @@ S_HIST = float(resid_all.std())
 
 
 def load_hist_kernel():
-    """Kernel learned from June 2022 (notebook section 16) - uses no 2023 reading at all."""
+    """Kernel learned from June 2022 (historical_kernel.json) - uses no 2023 reading at all."""
     if not os.path.exists(HIST_KERNEL_FILE):
         return None, None
     with open(HIST_KERNEL_FILE) as f:
@@ -554,14 +574,14 @@ else:
     # learned from the pool stations only. The 40 test stations are never used for anything but scoring.
     proof_kernel, proof_s = load_hist_kernel()
     if proof_kernel is not None:
-        kernel_note = "Kernel learned from June 2022 (notebook section 16) — no 2023 reading outside the deployed sensors is used."
+        kernel_note = "Kernel and residual scale learned from June 2022 (historical_kernel.json) — no 2023 reading outside the deployed sensors is used."
     else:
         a_p, b_p = linear_fit(p_all[pool], y_all[pool])
         r_p = y_all[pool] - (a_p + b_p * p_all[pool])
         proof_kernel = learn_kernel(X_all[pool], r_p)
         proof_s = float(r_p.std())
         kernel_note = (f"`{HIST_KERNEL_FILE}` not found, so the kernel was learned from the non-test stations only. "
-                       "Add the file from notebook section 16 for the strict version.")
+                       "Add historical_kernel.json from sensor_placement_confirmatory.ipynb for the strict version.")
     kernel = proof_kernel                                       # used by placement below too
 
     model = fit_model(kernel, X_all[deployed], y_all[deployed], p_all[deployed], proof_s)
@@ -596,9 +616,10 @@ if mode == "real":
               delta_color="inverse")
     c3.metric("Readings worth checking", len(suspicious))
 else:
-    st.info("**Proof (simulation)** — starts with a few real sensors, places more one by one, and scores the "
-            f"predictions on {N_TEST_PROOF} held-out test stations that are never used for anything else. "
-            "Same protocol as the notebook.")
+    st.info("**Proof (simulation) — a demonstration.** Starts with a few real sensors, places more one by one, "
+            f"and scores the predictions on {N_TEST_PROOF} held-out test stations that are never used for anything "
+            "else. It uses June 2023 only and one split at a time, so its numbers will not match the paper; the "
+            "evaluation itself is in sensor_placement_confirmatory.ipynb.")
     st.caption(kernel_note)
     c1, c2, c3 = st.columns(3)
     c1.metric("Sensors in simulation", len(deployed))

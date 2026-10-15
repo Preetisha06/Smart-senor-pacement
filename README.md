@@ -1,6 +1,6 @@
 # Uncertainty-Guided Sensor Placement for Soil Moisture Monitoring
 
-A system that tells you **where to place your next soil-moisture sensor** so you learn the most from the fewest devices. It fuses a coarse, wide-area soil-moisture estimate with sparse ground sensors using a Gaussian Process. It recommends new sensor sites with a calibration-aware placement criterion, and it answers questions through a natural-language interface.
+A system that tells you **where to place your next soil-moisture sensor** so you learn the most from the fewest devices. It fuses a coarse, wide-area soil-moisture estimate (ERA5-Land reanalysis) with sparse ground sensors (USDA SCAN) using universal kriging, which is a Gaussian Process with a calibrated prior. It recommends new sensor sites with a calibration-aware placement criterion, and it answers questions through a natural-language interface.
 
 **Team:** Preetisha Jain (24BCT0227) · Srishti Saluja (24BCE2587) · Bhumi Tulsyan (24BCE0673) — VIT Vellore
 
@@ -8,35 +8,44 @@ A system that tells you **where to place your next soil-moisture sensor** so you
 
 ## Contribution
 
-Existing work falls into three separate lines. Satellite and reanalysis downscaling treats ground stations as fixed inputs. Sensor-placement theory chooses locations without a coarse prior. GIS chatbots only analyse data that already exists. This project joins the three:
+Satellite and reanalysis downscaling treats ground stations as fixed inputs. Sensor-placement theory chooses locations without a coarse prior. GIS chatbots only analyse data that already exists. This project joins the three:
 
-1. **Calibration-aware placement for coarse-prior / in-situ fusion.** A coarse product (ERA5-Land reanalysis or NASA SMAP satellite data) is calibrated against the ground sensors (`station ≈ a + b·coarse`), and a GP models what remains. Sensors are placed greedily using mutual information. The placement uncertainty includes the uncertainty of the calibration line itself (universal-kriging variance; see Zimmerman 2006, Zhu & Stein 2006). We apply this to the coarse-product/sensor fusion setting for soil moisture.
-2. **An empirical finding: a coarse prior helps only when the sensors are well placed.** With 5 randomly placed sensors, adding the calibrated prior makes error *worse* (8.65% vs 8.33%), because the calibration line is fitted on poorly spread points. Calibration-aware placement turns the same prior into a **12.5% error reduction** (7.29%).
-3. **A strict, leakage-free evaluation.** The kernel is learned from the *previous year* (2022). The only 2023 readings ever used are those of the chosen sensors. The evaluation covers 4 months, 50 paired runs each, and sign-test p-values. Baselines include random placement, k-means space-filling, and plain MI. Two coarse priors are tested: reanalysis (ERA5-Land) and satellite (SMAP).
-4. **A deployable interface.** A map app shows coverage gaps, recommends new sites and flags readings that disagree with their neighbours. It includes a chatbot that can only *select* pre-built calculations, so every number it reports comes from the model.
+1. **Calibration-aware placement for coarse-prior / in-situ fusion.** Station readings are modelled as `a + b·ERA5 + GP residual`, with a and b estimated by GLS (universal kriging). Sensors are placed greedily by a mutual-information ratio in which *both* terms are universal-kriging variances, so the uncertainty of the calibration line is counted. This builds on network-design work with estimated trends (Zimmerman 2006; Zhu & Stein 2006) and applies it to fusing coarse soil-moisture products with sensors.
+2. **A replicated finding: with only a few sensors, a coarse prior helps only when placement is calibration-aware.** With 5 randomly placed sensors, adding the prior made error *worse* in both years (2023: 9.04% vs 8.36%; 2024: 8.13% vs 8.02%). With calibration-aware placement, the same prior gave the lowest error of all methods (2023: 7.30%; 2024: 6.88%).
+3. **A development / confirmation split.** The method was developed on 2023 data, then frozen and tested once on 2024 data that played no part in any design choice. Kernels come from the previous year, and inference uses corrected confidence intervals with a Holm correction.
+4. **A deployable interface.** A map app shows coverage gaps, recommends new sites and flags readings that disagree with their neighbours. Its chatbot can only *select* pre-built calculations, so every number it reports comes from the model.
 
-## Main result (notebook section 16 — strict evaluation)
+## Main result: confirmatory evaluation on 2024 (`sensor_placement_confirmatory.ipynb`, section 6)
 
-Prediction error (MAE, % volumetric soil moisture) at 40 held-out stations, averaged over Apr/Jun/Aug/Oct 2023 (50 runs per month):
+MAE (% volumetric soil moisture) at 40 held-out stations, averaged over Apr/Jun/Aug/Oct 2024 (50 runs per month). The kernel and residual scale were learned from the same month of 2023.
 
 | Sensors | Random, no prior | Random + prior | k-means (space) + prior | k-means (space + wetness) + prior | MI + prior | **Calibration-aware MI + prior** |
 |---|---|---|---|---|---|---|
-| 5  | 8.33 | 8.65 | 8.05 | 7.99 | 8.04 | **7.29** |
-| 10 | 7.64 | 7.32 | 7.07 | 7.24 | 7.35 | **6.96** |
-| 20 | 7.08 | 6.82 | 6.84 | 6.83 | 6.76 | **6.75** |
-| 30 | 6.87 | 6.65 | 6.78 | 6.70 | 6.65 | **6.61** |
+| 5  | 8.02 | 8.13 | 7.19 | 7.26 | 7.39 | **6.88** |
+| 10 | 7.21 | 6.84 | 6.58 | 6.70 | 6.72 | **6.52** |
+| 20 | 6.57 | 6.38 | 6.38 | 6.26 | 6.31 | **6.25** |
+| 30 | 6.35 | 6.24 | 6.32 | 6.18 | 6.16 | **6.09** |
 
-Paired wins out of 200 runs for calibration-aware MI + prior (one-sided sign test):
+Improvement of calibration-aware MI + prior (baseline MAE − method MAE). The 95% CI comes from the corrected resampled t-test, which accounts for overlapping random splits. p-values are Holm-adjusted over 20 comparisons.
 
-| vs | n=5 | n=10 | n=20 | n=30 |
-|---|---|---|---|---|
-| Random, no prior | 160 (p<0.0001) | 150 (p<0.0001) | 134 (p<0.0001) | 132 (p<0.0001) |
-| Random + prior | 139 (p<0.0001) | 126 (p=0.0001) | 108 (n.s.) | 105 (n.s.) |
-| k-means (space) + prior | 130 (p<0.0001) | 117 (p=0.010) | 116 (p=0.014) | 113 (p=0.038) |
-| k-means (space + wetness) + prior | 129 (p<0.0001) | 133 (p<0.0001) | 110 (n.s.) | 112 (n.s.) |
-| MI + prior | 120 (p=0.003) | 119 (p=0.004) | 94 (n.s.) | 97 (n.s.) |
+| vs | Sensors | Improvement | 95% CI (MAE points) | p (Holm) | Months better |
+|---|---|---|---|---|---|
+| Random, no prior | 5 | **14.2%** | [+0.22, +2.05] | 0.29 | 4/4 |
+| Random, no prior | 10 | **9.6%** | [+0.18, +1.19] | 0.15 | 4/4 |
+| Random + prior | 5 | 15.4% | [−0.54, +3.03] | 1.00 | 4/4 |
+| k-means (space) + prior | 5 | 4.3% | [−0.59, +1.20] | 1.00 | 3/4 |
+| k-means (space + wetness) + prior | 5 | 5.2% | [−0.55, +1.31] | 1.00 | 3/4 |
+| MI + prior | 5 | 6.8% | [−0.40, +1.41] | 1.00 | 4/4 |
 
-**Satellite vs reanalysis (section 14):** the method also works with NASA SMAP. Calibration-aware MI + SMAP beats random placement without a prior in 140/200 runs at 5 sensors (p<0.0001). The 9 km ERA5-Land reanalysis is still the better prior at continental scale compared with 36 km SMAP (7.16% vs 7.60% at 5 sensors).
+**How to read this:**
+- **Best on average everywhere.** Calibration-aware MI had the lowest mean error at every budget in both the development year (2023) and the confirmatory year (2024).
+- **Clear gain over the original baseline.** Its gain over random placement without a prior replicated across years: 12.8% in 2023 and 14.2% in 2024 at 5 sensors. The CI excludes zero at 5 and 10 sensors in both years.
+- **Smaller gains over the strong baselines.** Against k-means and plain MI the gains are 4–7%. Their CIs include zero, so they are suggestive, not established.
+- **Nothing survives the strictest correction.** No comparison remains significant after Holm correction over all 20 tests. The corrected test is deliberately conservative.
+
+The full tables for both years are printed in the notebook and saved in `experiment_results.json`.
+
+**Satellite vs reanalysis (development protocol only, `sensor_placement.ipynb` section 14).** With NASA SMAP (36 km) as the prior, calibration-aware MI also improved on random placement without a prior (7.58% vs 8.34% at 5 sensors). ERA5-Land (9 km) was the better prior (7.16%). This comparison used the earlier protocol (kernel learned from non-test 2023 stations) and was not repeated in the confirmatory run.
 
 ---
 
@@ -44,35 +53,45 @@ Paired wins out of 200 runs for calibration-aware MI + prior (one-sided sign tes
 
 | File | What it is |
 |---|---|
-| `sensor_placement.ipynb` | Full pipeline with outputs: data download, GP, placement, all experiments (sections 1–16) |
-| `app.py` | Streamlit app (map + recommendations + reading checks + chatbot) |
-| `requirements.txt` | Python packages for the app |
-| `soil_moisture_clean.csv` | Cleaned station data, June 2023 (created by the notebook's Save cell) |
-| `era5_grid.csv` | Coarse ERA5-Land grid for the map (created by the app on first run) |
-| `historical_kernel.json` | GP kernel learned from June 2022 (section 16), used by the app's Proof mode |
-| `experiment_results.json` | Section 16 averages, shown by the app's chatbot |
+| `sensor_placement_confirmatory.ipynb` | **Authoritative evaluation**: corrected method, frozen protocol, 2023 development run + 2024 confirmatory run, corrected statistics |
+| `sensor_placement.ipynb` | Development record: data exploration, model variants, entropy vs MI, introduction of the ERA5 prior, SMAP comparison, first k-means tests (sections 1–16). Kept unchanged. |
+| `app.py`, `requirements.txt` | Streamlit app (map, recommendations, reading checks, chatbot) |
+| `experiment_results.json` | Confirmatory and development tables with CIs (read by the app's chatbot) |
+| `historical_kernel.json` | June 2022 kernel and residual scale, used by the app |
+| `run_metadata.json` | Library versions, retrieval dates, QC exclusions with reasons, kernels and every test set |
+| `snapshots/*.csv` | Station readings + ERA5-Land values exactly as used, for each month of 2022–2024 |
+| `figures/confirmatory_results.png` | Development vs confirmatory results figure |
+| `soil_moisture_clean.csv`, `era5_grid.csv` | June 2023 station data and map grid for the app |
 
 ### Where every number comes from
 
-| Result | Notebook section |
+| Result | Source |
 |---|---|
-| Main table and p-values above | 16 (strict: kernel from 2022) |
-| Four-month evaluation, kernel learned from non-test stations | 13 |
-| SMAP satellite vs ERA5 reanalysis | 14 |
-| k-means baselines | 15 (and 16) |
-| GP model variants (Matern, km distances, elevation) | 10 |
+| Main tables above | `sensor_placement_confirmatory.ipynb` section 6 (2024) |
+| Development results with the corrected code | `sensor_placement_confirmatory.ipynb` section 5 (2023) |
+| SMAP vs ERA5 | `sensor_placement.ipynb` section 14 (development protocol) |
+| GP model variants (Matérn, km distances, elevation) | `sensor_placement.ipynb` section 10 |
+
+### Changes made after the code audit (October 2026)
+
+1. GP optimiser restarts seeded. Earlier runs differed slightly: SMAP 7.60% in one run vs 7.58% in the final one.
+2. ERA5-Land requests fail loudly instead of silently switching to another model, in both the notebook and the app.
+3. The criterion and the predictor are both universal kriging. Previously the numerator used universal kriging and the denominator an ordinary GP, and the line was fitted by OLS.
+4. The residual scale is fixed from the historical month instead of being re-estimated from the few chosen sensors.
+5. Sign-test p-values on overlapping runs were replaced by corrected CIs and Holm-adjusted p-values.
+6. A confirmatory evaluation was added on 2024 data, untouched during development.
+7. QC: stations with a monthly mean below 1% or fewer than 20 valid days are excluded. Every exclusion is logged.
 
 ## Data
 
-- **Ground truth:** USDA NRCS SCAN network via the AWDB REST API (`SMS:-2:1`, soil moisture at 2 in / about 5 cm), monthly averages. Continental US, about 160–169 stations per month.
-- **Coarse prior 1:** ERA5-Land `soil_moisture_0_to_7cm` (reanalysis, about 9 km) via the Open-Meteo archive API.
-- **Coarse prior 2:** NASA SMAP L3 radiometer soil moisture, SPL3SMP (36 km), via `earthaccess` (needs a free NASA Earthdata login).
+- **Ground truth:** USDA NRCS SCAN via the AWDB REST API (`SMS:-2:1`, soil moisture at 2 in / about 5 cm), monthly means, continental US, 154–170 stations per month after QC.
+- **Coarse prior:** ERA5-Land `soil_moisture_0_to_7cm` (reanalysis, about 9 km) via the Open-Meteo archive API, `models=era5_land`.
+- **Satellite comparison:** NASA SMAP L3 SPL3SMP (36 km) via `earthaccess`. A free Earthdata login is needed, and it is used only in `sensor_placement.ipynb`.
 
 ## How to reproduce
 
-1. Open `sensor_placement.ipynb` in Google Colab and click **Runtime → Run all**.
-2. In section 14, enter a NASA Earthdata username and password (free at urs.earthdata.nasa.gov).
-3. A full run takes about 60 minutes.
+- **Main results:** open `sensor_placement_confirmatory.ipynb` in Google Colab and click **Runtime → Run all**. It takes about 30–40 minutes and needs no login. Results are deterministic.
+- **Development record and SMAP:** `sensor_placement.ipynb`. It takes about 60 minutes and needs a NASA Earthdata login in section 14.
 
 ## How to run the app
 
@@ -82,21 +101,23 @@ streamlit run app.py
 ```
 
 - **Real network mode:** uses every real sensor. It shows where sensors are missing, recommends new sites and flags readings worth checking.
-- **Proof mode:** starts with a few sensors, places more one by one, and scores predictions on 40 held-out test stations, using the 2022 kernel.
+- **Proof mode:** a *demonstration* on June 2023 with 40 held-out test stations and the 2022 kernel. It shows one split at a time, so its numbers differ from the paper's averages.
 - **Chatbot:** works without a key (keyword matching). Add a Gemini API key in the sidebar for natural-language routing.
 
 ## Limitations
 
-- One network (SCAN) in one country, with stations typically more than 100 km apart.
-- ERA5-Land is a reanalysis, not a satellite retrieval. SMAP is coarse (36 km) and weaker under dense vegetation.
-- Gains are largest at small budgets (5–10 sensors). Beyond about 20 sensors, all strategies converge.
-- Monthly averages only. Day-to-day dynamics are not modelled.
+- **Scope:** one network (SCAN) in one country, with stations typically more than 100 km apart. Monthly means only.
+- **Statistics:** months share most stations, so the pooled CIs treat months as independent, which may understate uncertainty. With a conservative overlap correction and 20 comparisons, no single comparison survives Holm adjustment.
+- **Gains:** the gains over k-means and plain MI are small (4–7% at 5 sensors) and not statistically established. Beyond about 20 sensors, all strategies converge.
+- **QC threshold:** the 1% threshold removes about 4 stations per month, mostly in the dry West (Utah and California). Some may be genuinely very dry soil rather than faulty sensors.
+- **Coarse products:** ERA5-Land is a reanalysis, not a satellite retrieval. SMAP is coarse (36 km), weaker under dense vegetation, and was compared only under the development protocol.
 
 ## Key references
 
 - A. Krause, A. Singh, C. Guestrin, "Near-optimal sensor placements in Gaussian processes," *JMLR* 9, 2008.
 - D. L. Zimmerman, "Optimal network design for spatial prediction, covariance parameter estimation, and empirical prediction," *Environmetrics* 17, 2006.
 - Z. Zhu, M. L. Stein, "Spatial sampling design for prediction with estimated parameters," *JABES* 11, 2006.
-- W. Dorigo et al., "The International Soil Moisture Network," *HESS*, 2021.
+- C. Nadeau, Y. Bengio, "Inference for the generalization error," *Machine Learning* 52, 2003.
+- G. L. Schaefer, M. H. Cosh, T. J. Jackson, "The USDA NRCS Soil Climate Analysis Network (SCAN)," *J. Atmos. Oceanic Technol.* 24, 2007.
 - J. Muñoz-Sabater et al., "ERA5-Land: a state-of-the-art global reanalysis dataset for land applications," *ESSD* 13, 2021.
-- P. E. O'Neill et al., SMAP L3 Radiometer Global Daily 36 km EASE-Grid Soil Moisture (SPL3SMP), NSIDC.
+- D. Entekhabi et al., "The Soil Moisture Active Passive (SMAP) mission," *Proc. IEEE* 98, 2010.
